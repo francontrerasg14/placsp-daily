@@ -1,0 +1,120 @@
+name: PLACSP diario (HTML)
+
+on:
+  schedule:
+    # GitHub usa UTC. 06:10 UTC ≈ 08:10 Madrid (verano) / 07:10 (invierno)
+    - cron: "10 6 * * *"
+  workflow_dispatch:
+    inputs:
+      date_override:
+        description: "YYYY-MM-DD (opcional; por defecto hoy Europe/Madrid)"
+        required: false
+      cpv_list:
+        description: "CPV separados por coma (opcional; si no, usa vars.CPV_LIST)"
+        required: false
+      mail_to:
+        description: "Destinatarios (coma) opcional; si no, secrets.MAIL_TO"
+        required: false
+
+env:
+  PYTHON_VERSION: "3.11"
+  TZ: "Europe/Madrid"
+
+jobs:
+  run-and-email:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ env.PYTHON_VERSION }}-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-${{ env.PYTHON_VERSION }}-
+
+      - name: Install deps
+        run: |
+          python -m pip install -U pip
+          pip install -r placsp/requirements.txt
+
+      - name: Build HTML report
+        id: build
+        shell: bash
+        env:
+          CPV_LIST: ${{ github.event.inputs.cpv_list || vars.CPV_LIST }}
+          DATE_OVERRIDE: ${{ github.event.inputs.date_override }}
+        run: |
+          python - << 'PY'
+          import os, json
+          from placsp.placsp_module import run_placsp, render_html_report, resolve_target_date
+
+          cpv_env = os.getenv('CPV_LIST') or ""
+          cpv = [c.strip() for c in cpv_env.split(',') if c.strip()] or None
+          date_iso = os.getenv('DATE_OVERRIDE') or None
+
+          df, csv_path, n = run_placsp(date_iso=date_iso, cpv=cpv, verbose=True)
+
+          target = resolve_target_date(date_iso)
+          iso_date = target.isoformat()
+          html_str = render_html_report(df, iso_date, cpv_targets=cpv or [])
+
+          out_path = f"report_{iso_date}.html"
+          with open(out_path, "w", encoding="utf-8") as f:
+              f.write(html_str)
+
+          # outputs
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as fh:
+              fh.write(f"rows={n}\n")
+              fh.write(f"date={iso_date}\n")
+              fh.write(f"html_path={out_path}\n")
+          PY
+
+      - name: Send HTML email (si hay resultados)
+        if: ${{ steps.build.outputs.rows != '0' }}
+        uses: dawidd6/action-send-mail@v6
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: ${{ vars.MAIL_SUBJECT_PREFIX || 'PLACSP Diario' }} — ${{ steps.build.outputs.date }} — ${{ steps.build.outputs.rows }} resultados
+          from: ${{ secrets.MAIL_FROM }}
+          to: ${{ github.event.inputs.mail_to || secrets.MAIL_TO }}
+          # Parte texto (multi-parte) por si el cliente no renderiza HTML
+          body: |
+            Licitaciones PLACSP por CPV — ${{ steps.build.outputs.date }}.
+            Resultados: ${{ steps.build.outputs.rows }}.
+            Si no ves el contenido HTML, revisa la versión web o solicita el CSV.
+          # Cuerpo HTML leído de archivo:
+          html_body: file://${{ steps.build.outputs.html_path }}
+
+      - name: Send HTML email (cero resultados)
+        if: ${{ steps.build.outputs.rows == '0' }}
+        uses: dawidd6/action-send-mail@v6
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: ${{ vars.MAIL_SUBJECT_PREFIX || 'PLACSP Diario' }} — ${{ steps.build.outputs.date }} — 0 resultados
+          from: ${{ secrets.MAIL_FROM }}
+          to: ${{ github.event.inputs.mail_to || secrets.MAIL_TO }}
+          body: |
+            No se han encontrado licitaciones para los CPV objetivo el ${{ steps.build.outputs.date }}.
+          html_body: file://${{ steps.build.outputs.html_path }}
+
+      - name: Publica artefacto (HTML)
+        uses: actions/upload-artifact@v4
+        with:
+          name: placsp-html-${{ steps.build.outputs.date }}
+          path: ${{ steps.build.outputs.html_path }}
+          retention-days: 14
