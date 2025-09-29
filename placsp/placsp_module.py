@@ -1,4 +1,4 @@
-# PLACSP daily tenders by CPV (sindicacion_643) — módulo con salida HTML
+# PLACSP daily tenders by CPV (sindicaciones 643 + 1044) — módulo con salida HTML
 # ----------------------------------------------------------------------
 import csv
 import datetime as dt
@@ -20,10 +20,17 @@ import pandas as pd
 
 DEFAULT_CPV = ["09330000", "45261215", "45315300"]
 PLACSP_TZ = "Europe/Madrid"
-ZIP_URL_TEMPLATE = (
-    "https://contrataciondelestado.es/sindicacion/sindicacion_643/"
-    "licitacionesPerfilesContratanteCompleto3_{yyyymm}.zip"
-)
+
+# Construye la URL del fichero ZIP mensual para una sindicación dada (643 o 1044)
+def month_zip_url(target_date: dt.date, feed: int) -> str:
+    if feed == 643:
+        pattern = "licitacionesPerfilesContratanteCompleto3"
+    elif feed == 1044:
+        pattern = "PlataformasAgregadasSinMenores"
+    else:
+        raise ValueError(f"Feed desconocido: {feed}")
+    return (f"https://contrataciondelestado.es/sindicacion/sindicacion_{feed}/"
+            f"{pattern}_{target_date.strftime('%Y%m')}.zip")
 
 # --- red con reintentos ---
 def http_get_bytes(url: str, timeout: int = 120, retries: int = 3, backoff: float = 1.5) -> bytes:
@@ -88,10 +95,8 @@ def extract_fields(entry: etree._Element) -> Dict[str, str]:
         "enlace": link,
     }
 
-def month_zip_url(target_date: dt.date) -> str:
-    return ZIP_URL_TEMPLATE.replace("{yyyymm}", target_date.strftime("%Y%m"))
-
 def process_zip_bytes(zip_bytes: bytes, iso_date: str, cpv_targets: Set[str]) -> List[Dict[str, str]]:
+    """Procesa un archivo ZIP de sindicación, filtrando entries por fecha y CPV."""
     found: List[Dict[str, str]] = []
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         for name in zf.namelist():
@@ -111,7 +116,7 @@ def process_zip_bytes(zip_bytes: bytes, iso_date: str, cpv_targets: Set[str]) ->
     return found
 
 def write_csv(rows: List[Dict[str, str]], path: str) -> None:
-    cols = ["expediente","objeto","organo","estado","importe","cpv","fecha_updated","enlace"]
+    cols = ["expediente", "objeto", "organo", "estado", "importe", "cpv", "fecha_updated", "enlace"]
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writeheader()
@@ -132,7 +137,7 @@ def run_placsp(
     verbose: bool = True,
 ):
     """
-    Ejecuta la descarga/filtrado para una fecha y CPV dados.
+    Ejecuta la descarga/filtrado para una fecha y CPV dados (combina sindicación 643 y 1044).
     Devuelve (df, out_path_generado, num_filas)
     """
     target = resolve_target_date(date_iso)
@@ -143,24 +148,34 @@ def run_placsp(
         raise ValueError("Sin CPV válidos (8 dígitos).")
 
     out_path = out_path or os.path.abspath(f"placsp_{iso_date}_cpv.csv")
-    url = month_zip_url(target)
+    url_643 = month_zip_url(target, 643)
+    url_1044 = month_zip_url(target, 1044)
 
     if verbose:
         print(f"[i] Fecha objetivo: {iso_date} ({PLACSP_TZ})")
         print(f"[i] CPV objetivo  : {', '.join(sorted(cpv_targets))}")
-        print(f"[i] Descargando ZIP: {url}")
+        print(f"[i] Descargando ZIP 643: {url_643}")
+        print(f"[i] Descargando ZIP 1044: {url_1044}")
 
-    zip_bytes = http_get_bytes(url)
+    # Descargar contenidos de ambos ZIP
+    zip_bytes_643 = http_get_bytes(url_643)
+    zip_bytes_1044 = http_get_bytes(url_1044)
 
     if verbose:
-        print("[i] Procesando .atom del ZIP…")
+        print("[i] Procesando .atom de los ZIP…")
 
-    rows = process_zip_bytes(zip_bytes, iso_date, cpv_targets)
-    df = pd.DataFrame(rows, columns=["expediente","objeto","organo","estado","importe","cpv","fecha_updated","enlace"])
+    # Procesar ambos archivos ZIP y combinar resultados
+    rows_643 = process_zip_bytes(zip_bytes_643, iso_date, cpv_targets)
+    rows_1044 = process_zip_bytes(zip_bytes_1044, iso_date, cpv_targets)
+    rows = rows_643 + rows_1044
+
+    # Construir DataFrame ordenado
+    df = pd.DataFrame(rows, columns=["expediente", "objeto", "organo", "estado", "importe", "cpv", "fecha_updated", "enlace"])
     if not df.empty:
-        df = df.sort_values(["organo","expediente"], na_position="last")
+        df = df.sort_values(["organo", "expediente"], na_position="last")
 
-    write_csv(rows, out_path)  # por si quieres conservar histórico en artefactos
+    # Guardar CSV con resultados combinados
+    write_csv(rows, out_path)
 
     if verbose:
         print(f"[ok] {len(rows)} licitaciones encontradas para {iso_date}.")
@@ -168,7 +183,7 @@ def run_placsp(
 
     return df, out_path, len(rows)
 
-# ---------- NUEVO: HTML ----------
+# ---------- HTML report generation ----------
 def render_html_report(
     df: pd.DataFrame,
     date_iso: str,
@@ -176,7 +191,7 @@ def render_html_report(
     title_prefix: str = "Licitaciones PLACSP por CPV",
 ) -> str:
     """
-    Devuelve HTML listo para enviar por correo (inlines CSS).
+    Devuelve un informe HTML listo para enviar por correo (CSS embebido).
     """
     total = 0 if df is None or df.empty else len(df)
     cpv_txt = ", ".join(sorted({c.zfill(8) for c in cpv_targets})) if cpv_targets else "—"
@@ -184,7 +199,7 @@ def render_html_report(
     def esc(x: Optional[str]) -> str:
         return html.escape("" if pd.isna(x) else str(x))
 
-    # filas
+    # Generar filas de la tabla HTML
     rows_html = ""
     if total:
         for _, r in df.iterrows():
@@ -203,7 +218,7 @@ def render_html_report(
         rows_html = """<tr><td colspan="8" style="text-align:center;padding:16px;color:#666;">
         No se han encontrado licitaciones para los CPV objetivo en la fecha indicada.</td></tr>"""
 
-    # HTML final
+    # Ensamblar HTML final con estilo en línea
     return f"""<!doctype html>
 <html lang="es">
 <head>
@@ -243,7 +258,7 @@ def render_html_report(
       <tbody>{rows_html}
       </tbody>
     </table>
-    <p class="footer">Fuente: Sindicación 643 (PLACSP). Este mensaje se generó automáticamente.</p>
+    <p class="footer">Fuente: Sindicaciones 643 y 1044 (PLACSP). Este mensaje se generó automáticamente.</p>
   </div>
 </body>
 </html>"""
