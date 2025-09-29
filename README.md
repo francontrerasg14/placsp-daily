@@ -1,1 +1,0 @@
-# placsp-daily
